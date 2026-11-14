@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>监控动作识别</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #121417;
+      --panel: #1c2128;
+      --line: #303844;
+      --text: #e7edf2;
+      --muted: #9aa6b2;
+      --accent: #d85a3a;
+      --ok: #7dcea0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.5 "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    main {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 28px 20px 48px;
+    }
+    h1 { font-size: 28px; font-weight: 650; margin: 0 0 6px; }
+    p.lead { margin: 0 0 22px; color: var(--muted); }
+    form, section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+    }
+    form { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+    input[type="file"] { max-width: 100%; }
+    button {
+      background: var(--accent);
+      color: white;
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 16px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.55; cursor: default; }
+    section { margin-top: 16px; }
+    .hidden { display: none; }
+    .bar {
+      height: 8px;
+      background: #2a313a;
+      border-radius: 99px;
+      overflow: hidden;
+      margin: 10px 0;
+    }
+    .bar span {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: var(--accent);
+    }
+    .counts { display: flex; gap: 16px; color: var(--muted); }
+    .counts strong { color: var(--text); }
+    canvas, img {
+      width: 100%;
+      margin-top: 12px;
+      background: black;
+      border-radius: 8px;
+    }
+    .alarm {
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      gap: 12px;
+      padding: 10px 0;
+      border-top: 1px solid var(--line);
+    }
+    .alarm img { margin: 0; }
+    .alarm h3 { margin: 0; color: var(--accent); }
+    .alarm p { margin: 4px 0 0; color: var(--muted); }
+    #banner {
+      margin-top: 16px;
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: #6d2418;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>监控动作识别</h1>
+    <p class="lead">选择监控视频后，页面会逐帧调用姿态模型和香烟模型。抽烟需要连续多帧同时看到手靠近嘴和香烟，判定和本机相同。</p>
+    <form id="form">
+      <input id="file" type="file" accept="video/*" required>
+      <label><input id="skeleton" type="checkbox" checked> 显示骨架</label>
+      <button id="submit" type="submit">开始识别</button>
+    </form>
+    <section id="work" class="hidden">
+      <div id="message">准备中</div>
+      <div class="bar"><span id="bar"></span></div>
+      <div class="counts" id="counts"></div>
+      <div id="banner" class="hidden"></div>
+      <canvas id="view" class="hidden"></canvas>
+      <div id="alarms"></div>
+    </section>
+  </main>
+  <script src="https://unpkg.com/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
+  <script>
+/* Browser-side action monitor. Runtime comes from unpkg so visitors are not
+   limited by this computer's upload speed. */
+(function () {
+  const POSE_URL = "https://cdn.jsdelivr.net/gh/Leviathanlzx/cgr_detection@main/models/yolov8n-pose.onnx";
+  const CIG_URL = "https://cdn.jsdelivr.net/gh/Leviathanlzx/cgr_detection@main/models/last.onnx";
+  const LABELS = { smoking: "抽烟", urinating: "随地小便", defecating: "随地大便" };
+  const THRESHOLDS = { smoking: 8, urinating: 10, defecating: 12 };
+  const SKELETON = [[5, 7], [7, 9], [6, 8], [8, 10], [5, 6], [5, 11], [6, 12], [11, 12], [11, 13], [13, 15], [12, 14], [14, 16]];
+  let models = null;
+
+  function configureOrt() {
+    ort.env.wasm.numThreads = 1;
+    ort.env.wasm.proxy = false;
+    ort.env.wasm.wasmPaths = "https://unpkg.com/onnxruntime-web@1.18.0/dist/";
+  }
+
+  function modelCandidates(fileName, remoteUrl) {
+    return [
+      "https://gh-proxy.com/https://github.com/Leviathanlzx/cgr_detection/raw/main/models/" + fileName,
+      new URL("../models/" + fileName, document.baseURI).href,
+      new URL("models/" + fileName, document.baseURI).href,
+      remoteUrl,
+    ];
+  }
+
+  async function fetchModel(fileName, remoteUrl, label, onStatus) {
+    let lastError = "没有可用地址";
+    for (const url of modelCandidates(fileName, remoteUrl)) {
+      onStatus("正在加载" + label + "…");
+      try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(String(response.status));
+        const buffer = await response.arrayBuffer();
+        if (buffer.byteLength < 100000) throw new Error("文件不完整");
+        return buffer;
+      } catch (error) {
+        lastError = error.message || String(error);
+      }
+    }
+    throw new Error(label + "没有加载成功（" + lastError + "），检测没有开始");
+  }
+
+  async function loadModels(onStatus) {
+    if (models) return models;
+    if (typeof ort === "undefined") {
+      throw new Error("浏览器推理组件没有加载，无法调用模型");
+    }
+    configureOrt();
+    const poseBuffer = await fetchModel("yolov8n-pose.onnx", POSE_URL, "人体姿态模型", onStatus);
+    onStatus("正在初始化人体姿态模型…");
+    const pose = await ort.InferenceSession.create(poseBuffer, { executionProviders: ["wasm"] });
+    let cigarette = null;
+    try {
+      const cigaretteBuffer = await fetchModel("last.onnx", CIG_URL, "香烟模型", onStatus);
+      cigarette = await ort.InferenceSession.create(cigaretteBuffer, { executionProviders: ["wasm"] });
+    } catch (error) {
+      console.warn(error);
+    }
+    models = { pose, cigarette };
+    return models;
+  }
+
+  function tensorFromSource(source, sourceWidth, sourceHeight, smooth) {
+    const length = Math.max(sourceWidth, sourceHeight);
+    const square = document.createElement("canvas");
+    square.width = length;
+    square.height = length;
+    const squareCtx = square.getContext("2d");
+    squareCtx.imageSmoothingEnabled = smooth;
+    squareCtx.drawImage(source, 0, 0, sourceWidth, sourceHeight);
+    const sized = document.createElement("canvas");
+    sized.width = 640;
+    sized.height = 640;
+    const sizedCtx = sized.getContext("2d");
+    sizedCtx.imageSmoothingEnabled = smooth;
+    sizedCtx.drawImage(square, 0, 0, 640, 640);
+    const pixels = sized.getContext("2d").getImageData(0, 0, 640, 640).data;
+    const data = new Float32Array(3 * 640 * 640);
+    const plane = 640 * 640;
+    for (let i = 0; i < plane; i += 1) {
+      data[i] = pixels[i * 4] / 255;
+      data[plane + i] = pixels[i * 4 + 1] / 255;
+      data[plane * 2 + i] = pixels[i * 4 + 2] / 255;
+    }
+    return {
+      tensor: new ort.Tensor("float32", data, [1, 3, 640, 640]),
+      scale: length / 640,
+    };
+  }
+
+  async function runSession(session, source, sourceWidth, sourceHeight, smooth = true) {
+    const prepared = tensorFromSource(source, sourceWidth, sourceHeight, smooth);
+    const inputName = session.inputNames[0];
+    const output = await session.run({ [inputName]: prepared.tensor });
+    const outputName = session.outputNames[0];
+    return { output: output[outputName], scale: prepared.scale };
+  }
+
+  function decodeDetections(output, scale, conf, keypointMode) {
+    const anchors = output.dims[2];
+    const data = output.data;
+    const boxes = [];
+    const scores = [];
+    const keypoints = [];
+    for (let anchor = 0; anchor < anchors; anchor += 1) {
+      const score = data[4 * anchors + anchor];
+      if (score < conf) continue;
+      const cx = data[anchor];
+      const cy = data[anchors + anchor];
+      const width = data[2 * anchors + anchor];
+      const height = data[3 * anchors + anchor];
+      boxes.push([
+        (cx - width / 2) * scale,
+        (cy - height / 2) * scale,
+        (cx + width / 2) * scale,
+        (cy + height / 2) * scale,
+      ]);
+      scores.push(score);
+      if (!keypointMode) continue;
+      const points = [];
+      let maxCoord = 0;
+      for (let joint = 0; joint < 17; joint += 1) {
+        const base = 5 + joint * 3;
+        const x = data[base * anchors + anchor];
+        const y = data[(base + 1) * anchors + anchor];
+        const pointConf = data[(base + 2) * anchors + anchor];
+        maxCoord = Math.max(maxCoord, x, y);
+        points.push([x, y, pointConf]);
+      }
+      const unit = maxCoord <= 2 ? 640 : 1;
+      keypoints.push(points.map((point) => [point[0] * unit * scale, point[1] * unit * scale, point[2]]));
+    }
+    return nms(boxes, scores, keypoints, 0.5);
+  }
+
+  function nms(boxes, scores, keypoints, iouLimit) {
+    const order = scores.map((score, index) => index).sort((a, b) => scores[b] - scores[a]);
+    const kept = [];
+    const used = new Array(order.length).fill(false);
+    order.forEach((index, position) => {
+      if (used[position]) return;
+      kept.push({
+        box: boxes[index],
+        score: scores[index],
+        keypoints: keypoints[index] || null,
+      });
+      for (let other = position + 1; other < order.length; other += 1) {
+        if (!used[other] && iou(boxes[index], boxes[order[other]]) > iouLimit) used[other] = true;
+      }
+    });
+    return kept;
+  }
+
+  function iou(a, b) {
+    const x1 = Math.max(a[0], b[0]);
+    const y1 = Math.max(a[1], b[1]);
+    const x2 = Math.min(a[2], b[2]);
+    const y2 = Math.min(a[3], b[3]);
+    const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+    const area = Math.max(0, a[2] - a[0]) * Math.max(0, a[3] - a[1])
+      + Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]) - inter;
+    return area > 0 ? inter / area : 0;
+  }
+
+  function ok(points, index) {
+    return points[index][2] >= 0.35;
+  }
+
+  function angle(a, b, c) {
+    const v1x = a[0] - b[0];
+    const v1y = a[1] - b[1];
+    const v2x = c[0] - b[0];
+    const v2y = c[1] - b[1];
+    const n1 = Math.hypot(v1x, v1y);
+    const n2 = Math.hypot(v2x, v2y);
+    if (n1 < 1e-3 || n2 < 1e-3) return null;
+    const cos = Math.min(1, Math.max(-1, (v1x * v2x + v1y * v2y) / (n1 * n2)));
+    return Math.acos(cos) * 180 / Math.PI;
+  }
+
+  function mid(points) {
+    const sum = points.reduce((acc, point) => [acc[0] + point[0], acc[1] + point[1]], [0, 0]);
+    return [sum[0] / points.length, sum[1] / points.length];
+  }
+
+  function torso(points) {
+    const shoulders = [5, 6].filter((index) => ok(points, index)).map((index) => points[index]);
+    const hips = [11, 12].filter((index) => ok(points, index)).map((index) => points[index]);
+    if (!shoulders.length || !hips.length) return null;
+    const length = Math.hypot(mid(shoulders)[0] - mid(hips)[0], mid(shoulders)[1] - mid(hips)[1]);
+    return length < 8 ? null : length;
+  }
+
+  function handNearMouth(points) {
+    const scale = torso(points);
+    if (scale === null || !ok(points, 0)) return false;
+    const pairs = [[5, 7, 9], [6, 8, 10]];
+    return pairs.some(([shoulder, elbow, wrist]) => {
+      if (!ok(points, shoulder) || !ok(points, elbow) || !ok(points, wrist)) return false;
+      const distance = Math.hypot(points[0][0] - points[wrist][0], points[0][1] - points[wrist][1]) / scale;
+      const bend = angle(points[shoulder], points[elbow], points[wrist]);
+      return distance < 0.85 && bend !== null && bend < 80;
+    });
+  }
+
+  function legMetrics(points, scale) {
+    const angles = [];
+    const shins = [];
+    [[11, 13, 15], [12, 14, 16]].forEach(([hip, knee, ankle]) => {
+      if (!ok(points, hip) || !ok(points, knee) || !ok(points, ankle)) return;
+      const bend = angle(points[hip], points[knee], points[ankle]);
+      if (bend === null) return;
+      angles.push(bend);
+      shins.push((points[ankle][1] - points[knee][1]) / scale);
+    });
+    return [angles, shins];
+  }
+
+  function urinatingPose(points) {
+    const scale = torso(points);
+    if (scale === null) return false;
+    const [angles, shins] = legMetrics(points, scale);
+    if (!angles.length || Math.min(...angles) < 145) return false;
+    if (shins.length && Math.min(...shins) < 0.45) return false;
+    const hips = [11, 12].filter((index) => ok(points, index)).map((index) => points[index]);
+    const knees = [13, 14].filter((index) => ok(points, index)).map((index) => points[index]);
+    if (!hips.length || !knees.length) return false;
+    const hip = mid(hips);
+    const knee = mid(knees);
+    const groin = [hip[0] + 0.28 * (knee[0] - hip[0]), hip[1] + 0.28 * (knee[1] - hip[1])];
+    let near = 0;
+    [9, 10].forEach((wrist) => {
+      if (!ok(points, wrist)) return;
+      if (points[wrist][1] < hip[1] - 0.15 * scale) return;
+      const distance = Math.hypot(points[wrist][0] - groin[0], points[wrist][1] - groin[1]);
+      if (distance < 0.38 * scale) near += 1;
+    });
+    return near === 1;
+  }
+
+  function defecatingPose(points) {
+    const scale = torso(points);
+    if (scale === null) return false;
+    const [angles, shins] = legMetrics(points, scale);
+    if (!angles.length || !shins.length) return false;
+    const shoulders = [5, 6].filter((index) => ok(points, index)).map((index) => points[index]);
+    const hips = [11, 12].filter((index) => ok(points, index)).map((index) => points[index]);
+    const ankles = [15, 16].filter((index) => ok(points, index)).map((index) => points[index]);
+    if (!shoulders.length || !hips.length || !ankles.length) return false;
+    const shoulderY = mid(shoulders)[1];
+    const hipY = mid(hips)[1];
+    const ankleY = mid(ankles)[1];
+    const span = ankleY - shoulderY;
+    if (span < scale * 0.35) return false;
+    const drop = (hipY - shoulderY) / span;
+    return Math.min(...angles) < 110 && Math.min(...shins) < 0.55 && drop > 0.62;
+  }
+
+  function classify(points, cigaretteHit) {
+    const squatting = defecatingPose(points);
+    const peeing = urinatingPose(points) && !squatting;
+    return {
+      smoking: handNearMouth(points) && cigaretteHit && !squatting && !peeing,
+      urinating: peeing,
+      defecating: squatting,
+    };
+  }
+
+  function mouthHasCigarette(session, frame, person) {
+    if (!session || !handNearMouth(person.keypoints)) return false;
+    const box = person.box;
+    const nose = person.keypoints[0];
+    const noseX = Math.trunc(nose[0]);
+    const noseY = Math.trunc(nose[1]);
+    const halfH = Math.trunc(0.4 * Math.max(box[2] - box[0], 1));
+    const halfW = Math.trunc(0.3 * Math.max(box[3] - box[1], 1));
+    const x1 = Math.max(0, noseX - halfW);
+    const y1 = Math.max(0, noseY - halfH);
+    const x2 = Math.min(frame.width, noseX + halfW);
+    const y2 = Math.min(frame.height, noseY + halfH);
+    if (x2 - x1 < 4 || y2 - y1 < 4) return false;
+    const crop = document.createElement("canvas");
+    crop.width = x2 - x1;
+    crop.height = y2 - y1;
+    crop.getContext("2d").drawImage(frame, x1, y1, crop.width, crop.height, 0, 0, crop.width, crop.height);
+    return runSession(session, crop, crop.width, crop.height, false).then((result) => {
+      return decodeDetections(result.output, result.scale, 0.35, false).length > 0;
+    });
+  }
+
+  function Tracker() {
+    this.tracks = [];
+    this.nextId = 1;
+  }
+
+  Tracker.prototype.update = function update(people) {
+    const used = new Set();
+    return people.map((person) => {
+      let best = -1;
+      let bestIou = 0.3;
+      this.tracks.forEach((track, index) => {
+        if (used.has(index)) return;
+        const overlap = iou(person.box, track.box);
+        if (overlap > bestIou) {
+          bestIou = overlap;
+          best = index;
+        }
+      });
+      let track;
+      if (best === -1) {
+        track = { id: this.nextId, box: person.box, missing: 0, score: emptyScores(), latched: emptyFlags() };
+        this.nextId += 1;
+        this.tracks.push(track);
+        used.add(this.tracks.length - 1);
+      } else {
+        used.add(best);
+        track = this.tracks[best];
+        track.box = person.box;
+        track.missing = 0;
+      }
+      return track;
+    });
+  };
+
+  Tracker.prototype.age = function age(matched) {
+    const keep = new Set(matched);
+    this.tracks.forEach((track) => {
+      if (!keep.has(track)) track.missing += 1;
+    });
+    this.tracks = this.tracks.filter((track) => track.missing <= 20);
+  };
+
+  function emptyScores() {
+    return { smoking: 0, urinating: 0, defecating: 0 };
+  }
+
+  function emptyFlags() {
+    return { smoking: false, urinating: false, defecating: false };
+  }
+
+  function advance(track, flags, thresholds) {
+    const fired = [];
+    Object.keys(LABELS).forEach((name) => {
+      track.score[name] = flags[name] ? Math.min(40, track.score[name] + 1) : Math.max(0, track.score[name] - 1);
+      if (track.score[name] >= thresholds[name] && !track.latched[name]) {
+        track.latched[name] = true;
+        fired.push(name);
+      } else if (track.score[name] < thresholds[name] * 0.4) {
+        track.latched[name] = false;
+      }
+    });
+    return fired;
+  }
+
+  function drawFrame(view, frame, people, tracks, showSkeleton) {
+    const ctx = view.getContext("2d");
+    view.width = frame.width;
+    view.height = frame.height;
+    ctx.drawImage(frame, 0, 0);
+    people.forEach((person, index) => {
+      const track = tracks[index];
+      const name = Object.keys(LABELS).reduce((best, key) => (track.score[key] > track.score[best] ? key : best));
+      if (track.score[name] <= 0) return;
+      const color = track.latched[name] ? "#ff3b30" : "#ff9f0a";
+      const label = track.latched[name] ? LABELS[name] : "可疑 " + LABELS[name];
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.strokeRect(person.box[0], person.box[1], person.box[2] - person.box[0], person.box[3] - person.box[1]);
+      ctx.font = "20px sans-serif";
+      ctx.fillStyle = color;
+      ctx.fillText(label, person.box[0], Math.max(24, person.box[1] - 8));
+      if (showSkeleton) drawSkeleton(ctx, person.keypoints);
+    });
+    const active = Object.keys(LABELS).filter((name) => tracks.some((track) => track.latched[name]));
+    if (active.length) {
+      ctx.fillStyle = "#dc2418";
+      ctx.fillRect(0, 0, view.width, 42);
+      ctx.fillStyle = "white";
+      ctx.font = "22px sans-serif";
+      ctx.fillText("报警 " + active.map((name) => LABELS[name]).join(" / "), 12, 28);
+    }
+  }
+
+  function drawSkeleton(ctx, points) {
+    ctx.strokeStyle = "#64d2ff";
+    ctx.lineWidth = 2;
+    SKELETON.forEach(([a, b]) => {
+      if (points[a][2] < 0.4 || points[b][2] < 0.4) return;
+      ctx.beginPath();
+      ctx.moveTo(points[a][0], points[a][1]);
+      ctx.lineTo(points[b][0], points[b][1]);
+      ctx.stroke();
+    });
+  }
+
+  function readU32(bytes, offset) {
+    return bytes[offset] * 16777216 + (bytes[offset + 1] << 16) + (bytes[offset + 2] << 8) + bytes[offset + 3];
+  }
+
+  function fpsFromMp4(bytes) {
+    let timescale = 0;
+    for (let i = 0; i < bytes.length - 32; i += 1) {
+      if (bytes[i] !== 109 || bytes[i + 1] !== 100 || bytes[i + 2] !== 104 || bytes[i + 3] !== 100) continue;
+      const version = bytes[i + 4];
+      timescale = readU32(bytes, version === 1 ? i + 24 : i + 16);
+      break;
+    }
+    if (!timescale) return 0;
+    for (let i = 0; i < bytes.length - 24; i += 1) {
+      if (bytes[i] !== 115 || bytes[i + 1] !== 116 || bytes[i + 2] !== 116 || bytes[i + 3] !== 115) continue;
+      const entries = readU32(bytes, i + 8);
+      const delta = readU32(bytes, i + 16);
+      if (entries < 1 || delta < 1) continue;
+      const fps = timescale / delta;
+      if (fps >= 5 && fps <= 120) return Math.round(fps);
+    }
+    return 0;
+  }
+
+  async function readFps(file) {
+    const head = new Uint8Array(await file.slice(0, Math.min(file.size, 2 * 1024 * 1024)).arrayBuffer());
+    const fromHead = fpsFromMp4(head);
+    if (fromHead) return fromHead;
+    if (file.size > head.byteLength) {
+      const tailSize = Math.min(file.size, 4 * 1024 * 1024);
+      const tail = new Uint8Array(await file.slice(file.size - tailSize).arrayBuffer());
+      const fromTail = fpsFromMp4(tail);
+      if (fromTail) return fromTail;
+    }
+    return 30;
+  }
+
+  function seekTo(video, time) {
+    return new Promise((resolve) => {
+      if (Math.abs(video.currentTime - time) < 0.0005) {
+        resolve();
+        return;
+      }
+      const done = () => {
+        video.removeEventListener("seeked", done);
+        resolve();
+      };
+      video.addEventListener("seeked", done);
+      video.currentTime = Math.max(0, time);
+    });
+  }
+
+  async function frameAt(video, canvas, time) {
+    await seekTo(video, time);
+    if (video.requestVideoFrameCallback) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 80);
+        video.requestVideoFrameCallback(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    if (video.readyState < 2 || video.videoWidth < 2) {
+      throw new Error("视频帧还没准备好，已停止检测");
+    }
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext("2d", { willReadFrequently: true }).drawImage(video, 0, 0, canvas.width, canvas.height);
+  }
+
+  function frameDigest(canvas) {
+    const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+    let hash = 2166136261;
+    for (let i = 0; i < data.length; i += 4099) {
+      hash ^= data[i];
+      hash = Math.imul(hash, 16777619);
+    }
+    return hash >>> 0;
+  }
+
+  async function analyze(file, ui) {
+    const loaded = await loadModels(ui.setMessage);
+    const thresholds = Object.assign({}, THRESHOLDS);
+    if (!loaded.cigarette) thresholds.smoking = 18;
+    const fps = await readFps(file);
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    await new Promise((resolve, reject) => {
+      const ready = () => {
+        if (video.videoWidth > 0) resolve();
+      };
+      video.onloadeddata = ready;
+      video.onerror = () => reject(new Error("无法读取这段视频。浏览器解不出画面时，请换成 H.264 的 MP4"));
+      video.src = URL.createObjectURL(file);
+      if (video.readyState >= 2 && video.videoWidth > 0) resolve();
+    });
+    if (!Number.isFinite(video.duration) || video.duration <= 0 || video.videoWidth === 0) {
+      throw new Error("视频还没有解码出画面，模型没有开始检测");
+    }
+    const duration = video.duration;
+    const total = Math.max(1, Math.round(duration * fps));
+    const frame = document.createElement("canvas");
+    const tracker = new Tracker();
+    const counts = emptyScores();
+    let previousDigest = null;
+    ui.prepare(video.videoWidth, video.videoHeight);
+    ui.setMessage("按每一帧检测，共 " + total + " 帧");
+    for (let index = 0; index < total; index += 1) {
+      if (ui.shouldStop()) break;
+      const time = Math.min(Math.max(0, duration - 0.001), (index + 0.5) / fps);
+      await frameAt(video, frame, time);
+      const digest = frameDigest(frame);
+      if (digest === previousDigest) {
+        ui.onProgress(index + 1, total, counts);
+        continue;
+      }
+      previousDigest = digest;
+      const posed = await runSession(loaded.pose, frame, frame.width, frame.height);
+      const people = decodeDetections(posed.output, posed.scale, 0.45, true);
+      const hits = await Promise.all(people.map(async (person) => {
+        if (loaded.cigarette) return mouthHasCigarette(loaded.cigarette, frame, person);
+        return handNearMouth(person.keypoints);
+      }));
+      const tracks = tracker.update(people);
+      const fired = [];
+      people.forEach((person, personIndex) => {
+        const flags = classify(person.keypoints, hits[personIndex]);
+        advance(tracks[personIndex], flags, thresholds).forEach((name) => {
+          counts[name] += 1;
+          fired.push({ label: LABELS[name], time, trackId: tracks[personIndex].id });
+        });
+      });
+      tracker.age(tracks);
+      drawFrame(ui.canvas, frame, people, tracks, ui.skeleton);
+      const snapshot = fired.length ? ui.canvas.toDataURL("image/jpeg", 0.7) : "";
+      fired.forEach((alarm) => ui.onAlarm(Object.assign({ image: snapshot }, alarm)));
+      ui.onProgress(index + 1, total, counts, people.length);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    URL.revokeObjectURL(video.src);
+    ui.onProgress(total, total, counts);
+  }
+
+  window.BehaviorMonitor = { analyze, labels: LABELS };
+})();
+
+</script>
+  <script>
+    const form = document.querySelector("#form");
+    const work = document.querySelector("#work");
+    const message = document.querySelector("#message");
+    const bar = document.querySelector("#bar");
+    const counts = document.querySelector("#counts");
+    const banner = document.querySelector("#banner");
+    const view = document.querySelector("#view");
+    const alarms = document.querySelector("#alarms");
+    const submit = document.querySelector("#submit");
+    let stop = false;
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const file = document.querySelector("#file").files[0];
+      if (!file) return;
+      if (!window.BehaviorMonitor) {
+        work.classList.remove("hidden");
+        message.textContent = "失败：检测脚本没有加载";
+        return;
+      }
+      stop = false;
+      submit.disabled = true;
+      work.classList.remove("hidden");
+      view.classList.add("hidden");
+      alarms.replaceChildren();
+      banner.classList.add("hidden");
+      renderCounts({ smoking: 0, urinating: 0, defecating: 0 });
+      try {
+        if (await serverReady()) {
+          await runOnServer(file);
+        } else {
+          await BehaviorMonitor.analyze(file, {
+            canvas: view,
+            skeleton: document.querySelector("#skeleton").checked,
+            shouldStop: () => stop,
+            setMessage: (text) => { message.textContent = text; },
+            prepare: () => { view.classList.remove("hidden"); },
+            onProgress: (done, total, tally, people) => {
+              bar.style.width = Math.round(done / total * 100) + "%";
+              const found = people === undefined ? "" : "，本帧检出 " + people + " 人";
+              message.textContent = "模型推理 " + done + "/" + total + " 帧" + found;
+              renderCounts(tally);
+            },
+            onAlarm: showAlarm,
+          });
+          if (!stop) message.textContent = "模型检测完成";
+        }
+      } catch (error) {
+        message.textContent = "失败：" + (error.message || error);
+      }
+      submit.disabled = false;
+    });
+
+    async function serverReady() {
+      if (location.protocol === "file:") return false;
+      try {
+        const response = await fetch("/api/jobs", { method: "POST" });
+        return response.status === 400;
+      } catch (error) {
+        return false;
+      }
+    }
+
+    async function runOnServer(file) {
+      message.textContent = "正在调用本机模型";
+      const body = new FormData();
+      body.append("video", file);
+      body.append("skeleton", document.querySelector("#skeleton").checked ? "1" : "0");
+      const created = await fetch("/api/jobs", { method: "POST", body });
+      if (!created.ok) throw new Error("本机模型没有启动");
+      const job = await created.json();
+      let shown = 0;
+      let preview = document.querySelector("#preview");
+      while (!stop) {
+        const response = await fetch("/api/jobs/" + job.id);
+        if (!response.ok) throw new Error("检测进度丢失");
+        const state = await response.json();
+        const total = state.frames_total || 0;
+        bar.style.width = (total ? Math.min(100, Math.round(state.frames_done / total * 100)) : 8) + "%";
+        message.textContent = "本机模型检测中 " + state.frames_done + (total ? "/" + total : "") + " 帧";
+        renderCounts(state.counts || {});
+        if (state.frames_done > 0) {
+          if (!preview) {
+            preview = document.createElement("img");
+            preview.id = "preview";
+            preview.alt = "检测画面";
+            view.before(preview);
+          }
+          preview.src = state.preview_url + "?t=" + Date.now();
+        }
+        (state.events || []).slice(shown).forEach((item) => {
+          showAlarm({
+            label: item.label,
+            image: item.snapshot_url,
+            time: item.video_time,
+            trackId: item.track_id,
+          });
+        });
+        shown = (state.events || []).length;
+        if (state.status === "done") {
+          bar.style.width = "100%";
+          message.textContent = "本机模型检测完成";
+          if (state.playable && state.video_url) {
+            const player = document.createElement("video");
+            player.controls = true;
+            player.src = state.video_url;
+            (preview || view).replaceWith(player);
+          }
+          return;
+        }
+        if (state.status === "error") throw new Error(state.message || "检测失败");
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      }
+    }
+
+    function showAlarm(alarm) {
+      banner.classList.remove("hidden");
+      banner.textContent = "报警：" + alarm.label;
+      beep();
+      const row = document.createElement("article");
+      row.className = "alarm";
+      row.innerHTML = "<img alt=''><div><h3></h3><p></p></div>";
+      row.querySelector("img").src = alarm.image;
+      row.querySelector("h3").textContent = alarm.label;
+      const when = typeof alarm.time === "number" ? alarm.time.toFixed(1) : alarm.time;
+      row.querySelector("p").textContent = "视频 " + when + "s · 目标 " + alarm.trackId;
+      alarms.prepend(row);
+    }
+
+    function renderCounts(tally) {
+      counts.replaceChildren();
+      Object.entries(BehaviorMonitor.labels).forEach(([key, label]) => {
+        const item = document.createElement("span");
+        item.textContent = label + " " + (tally[key] || 0);
+        counts.appendChild(item);
+      });
+    }
+
+    function beep() {
+      const context = new AudioContext();
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      oscillator.frequency.value = 880;
+      oscillator.connect(gain);
+      gain.connect(context.destination);
+      gain.gain.value = 0.06;
+      oscillator.start();
+      oscillator.stop(context.currentTime + 0.28);
+    }
+  </script>
+</body>
+</html>
